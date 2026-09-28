@@ -93,6 +93,9 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     assert {:error, :invalid_github_api_url} =
              GitHubClient.validate_settings(tracker_settings(%{"api_url" => "http://api.github.com"}))
 
+    assert {:error, :invalid_github_issue_dependencies} =
+             GitHubClient.validate_settings(tracker_settings(%{"issue_dependencies" => "yes"}))
+
     assert GitHubClient.secret_environment_names(tracker_settings(%{"token" => "$SYMPHONY_GITHUB_TOKEN"})) == [
              "GITHUB_TOKEN",
              "GH_TOKEN",
@@ -236,6 +239,95 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
                  {:ok, %{status: 200, body: Map.put(raw_issue(3), "title", "")}}
                end
              )
+  end
+
+  test "GitHub dependencies hold blocked issues and release them after blockers close" do
+    settings =
+      tracker_settings(%{"issue_dependencies" => true})
+      |> Map.put(:required_labels, ["symphony-smoke"])
+
+    request_fun = fn "GET", path, params, nil, _settings ->
+      case path do
+        "/repos/octo/repo/issues" ->
+          assert params["state"] == "open"
+
+          {:ok,
+           %{
+             status: 200,
+             body: [
+               Map.put(raw_issue(1), "labels", [%{"name" => "symphony-smoke"}]),
+               Map.put(raw_issue(2), "labels", [%{"name" => "symphony-smoke"}]),
+               raw_issue(3)
+             ]
+           }}
+
+        "/repos/octo/repo/issues/1/dependencies/blocked_by" ->
+          assert params == %{"per_page" => 100, "page" => 1}
+          {:ok, %{status: 200, body: [%{"number" => 9, "state" => "open"}]}}
+
+        "/repos/octo/repo/issues/2/dependencies/blocked_by" ->
+          {:ok, %{status: 200, body: [%{"number" => 8, "state" => "closed"}]}}
+
+        other ->
+          flunk("unexpected dependency request: #{other}")
+      end
+    end
+
+    assert {:ok, [blocked, ready, unlabelled]} =
+             GitHubClient.fetch_issues_by_states_for_test(["open"], settings, request_fun)
+
+    assert blocked.blocked_by == [%{id: "9", identifier: "GH-9", state: "open"}]
+    refute blocked.dispatchable
+    assert ready.blocked_by == [%{id: "8", identifier: "GH-8", state: "closed"}]
+    assert ready.dispatchable
+    assert unlabelled.blocked_by == []
+  end
+
+  test "dependency lookup errors fail closed for both polling and issue refresh" do
+    settings = tracker_settings(%{"issue_dependencies" => true})
+
+    request_fun = fn "GET", path, _params, nil, _settings ->
+      case path do
+        "/repos/octo/repo/issues" ->
+          {:ok, %{status: 200, body: [raw_issue(1)]}}
+
+        "/repos/octo/repo/issues/1" ->
+          {:ok, %{status: 200, body: raw_issue(1)}}
+
+        "/repos/octo/repo/issues/1/dependencies/blocked_by" ->
+          {:ok, %{status: 403, body: %{"message" => "Forbidden"}}}
+      end
+    end
+
+    assert {:error, {:github_api_status, 403}} =
+             GitHubClient.fetch_issues_by_states_for_test(["open"], settings, request_fun)
+
+    assert {:error, {:github_api_status, 403}} =
+             GitHubClient.fetch_issues_by_ids_for_test(["1"], settings, request_fun)
+  end
+
+  test "issue refresh changes dispatchability when a native blocker closes" do
+    settings = tracker_settings(%{"issue_dependencies" => true})
+    Process.put(:blocker_state, "open")
+
+    request_fun = fn "GET", path, _params, nil, _settings ->
+      case path do
+        "/repos/octo/repo/issues/1" ->
+          {:ok, %{status: 200, body: raw_issue(1)}}
+
+        "/repos/octo/repo/issues/1/dependencies/blocked_by" ->
+          state = Process.get(:blocker_state)
+          {:ok, %{status: 200, body: [%{"number" => 2, "state" => state}]}}
+      end
+    end
+
+    assert {:ok, [%{dispatchable: false}]} =
+             GitHubClient.fetch_issues_by_ids_for_test(["1"], settings, request_fun)
+
+    Process.put(:blocker_state, "closed")
+
+    assert {:ok, [%{dispatchable: true}]} =
+             GitHubClient.fetch_issues_by_ids_for_test(["1"], settings, request_fun)
   end
 
   test "github_api preserves REST status and body while rejecting unsafe arguments" do
