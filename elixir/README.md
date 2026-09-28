@@ -257,6 +257,12 @@ codex:
 - Reads and identity: polling is scoped to the configured repository; `issue.id` is the
   repository issue number, `issue.identifier` is `GH-<number>`, hidden or deleted `404` issues are
   omitted on refresh, and pull requests returned by the Issues API are not dispatchable.
+- Optional dependencies: set `tracker.provider.issue_dependencies: true` to read GitHub's native
+  `blocked_by` issue relationships for open issues matching `tracker.required_labels`.
+  An issue with any open or indeterminate blocker is not dispatchable; it becomes eligible after
+  all blockers close. Dependency lookup errors stop the poll or refresh rather than launching
+  potentially blocked work. This makes one additional paginated API read per matching open issue
+  on each poll, so choose a polling interval and dispatch label appropriate for the backlog size.
 - Tool and auth: `github_api` accepts a relative REST `path` plus optional `params` and JSON
   `body`; Symphony executes it host-side with the session-bound token, removes configured tracker
   credentials and provider authentication aliases from the Codex child, and leaves raw tool access

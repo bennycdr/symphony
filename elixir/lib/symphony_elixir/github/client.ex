@@ -82,8 +82,10 @@ defmodule SymphonyElixir.GitHub.Client do
         {:ok, []}
 
       state_query ->
-        with {:ok, github_settings} <- settings(tracker_settings) do
-          do_fetch_pages(github_settings, state_query, normalized_states, 1, request_fun, [])
+        with {:ok, github_settings} <- settings(tracker_settings),
+             {:ok, issues} <-
+               do_fetch_pages(github_settings, state_query, normalized_states, 1, request_fun, []) do
+          attach_dependencies(issues, github_settings, request_fun)
         end
     end
   end
@@ -96,8 +98,9 @@ defmodule SymphonyElixir.GitHub.Client do
         {:ok, []}
 
       ids ->
-        with {:ok, github_settings} <- settings(tracker_settings) do
-          fetch_issue_ids(ids, github_settings, request_fun, [])
+        with {:ok, github_settings} <- settings(tracker_settings),
+             {:ok, issues} <- fetch_issue_ids(ids, github_settings, request_fun, []) do
+          attach_dependencies(issues, github_settings, request_fun)
         end
     end
   end
@@ -205,6 +208,82 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp normalize_issue(_issue, _repo), do: nil
 
+  defp attach_dependencies(issues, %{issue_dependencies: false}, _request_fun), do: {:ok, issues}
+
+  defp attach_dependencies(issues, settings, request_fun) do
+    Enum.reduce_while(issues, {:ok, []}, fn %Issue{} = issue, {:ok, acc} ->
+      case attach_issue_dependencies(issue, settings, request_fun) do
+        {:ok, issue} -> {:cont, {:ok, [issue | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      error -> error
+    end
+  end
+
+  defp attach_issue_dependencies(%Issue{} = issue, settings, request_fun) do
+    if dependency_check_required?(issue, settings.required_labels) do
+      with {:ok, blockers} <- fetch_blockers(settings, issue.id, request_fun, 1, []) do
+        {:ok,
+         %Issue{
+           issue
+           | blocked_by: blockers,
+             dispatchable: Enum.all?(blockers, &(&1.state == "closed"))
+         }}
+      end
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp dependency_check_required?(%Issue{state: state, dispatchable: true, labels: labels}, required_labels) do
+    normalize_state(state) == "open" and Enum.all?(required_labels, &(&1 in labels))
+  end
+
+  defp dependency_check_required?(_issue, _required_labels), do: false
+
+  defp fetch_blockers(settings, issue_number, request_fun, page, acc) do
+    path = "#{repository_issue_path(settings, issue_number)}/dependencies/blocked_by"
+
+    with {:ok, payload} <-
+           request_with_settings(
+             "GET",
+             path,
+             %{"per_page" => @page_size, "page" => page},
+             nil,
+             settings,
+             request_fun,
+             false
+           ),
+         true <- is_list(payload) or {:error, :github_unknown_payload},
+         {:ok, blockers} <- normalize_blockers(payload) do
+      updated_acc = [blockers | acc]
+
+      if length(payload) < @page_size do
+        {:ok, updated_acc |> Enum.reverse() |> List.flatten()}
+      else
+        fetch_blockers(settings, issue_number, request_fun, page + 1, updated_acc)
+      end
+    end
+  end
+
+  defp normalize_blockers(payload) do
+    blockers = Enum.map(payload, &normalize_blocker/1)
+
+    if Enum.any?(blockers, &is_nil/1),
+      do: {:error, :github_unknown_payload},
+      else: {:ok, blockers}
+  end
+
+  defp normalize_blocker(%{"number" => number, "state" => state})
+       when is_integer(number) and number > 0 and is_binary(state) do
+    %{id: Integer.to_string(number), identifier: "GH-#{number}", state: normalize_state(state)}
+  end
+
+  defp normalize_blocker(_blocker), do: nil
+
   defp native_ref(issue, repo) do
     %{
       "id" => issue["id"],
@@ -287,18 +366,47 @@ defmodule SymphonyElixir.GitHub.Client do
     api_url = provider["api_url"] || @default_api_url
     repo = resolve_setting(provider["repo"], System.get_env("GITHUB_REPO"))
     token = resolve_setting(provider["token"], System.get_env("GITHUB_TOKEN"))
+    issue_dependencies = Map.get(provider, "issue_dependencies", false)
+    required_labels = tracker_settings |> Map.get(:required_labels, []) |> normalize_labels()
 
     cond do
-      not valid_api_url?(api_url) -> {:error, :invalid_github_api_url}
-      not present_string?(repo) -> {:error, :missing_github_repo}
-      not valid_repo?(repo) -> {:error, :invalid_github_repo}
-      not present_string?(token) -> {:error, :missing_github_token}
-      true -> {:ok, %{api_url: String.trim_trailing(api_url, "/"), repo: repo, token: token}}
+      not valid_api_url?(api_url) ->
+        {:error, :invalid_github_api_url}
+
+      not present_string?(repo) ->
+        {:error, :missing_github_repo}
+
+      not valid_repo?(repo) ->
+        {:error, :invalid_github_repo}
+
+      not present_string?(token) ->
+        {:error, :missing_github_token}
+
+      not is_boolean(issue_dependencies) ->
+        {:error, :invalid_github_issue_dependencies}
+
+      true ->
+        {:ok,
+         %{
+           api_url: String.trim_trailing(api_url, "/"),
+           repo: repo,
+           token: token,
+           issue_dependencies: issue_dependencies,
+           required_labels: required_labels
+         }}
     end
   end
 
   defp provider_settings(%{provider: provider}) when is_map(provider), do: provider
   defp provider_settings(_tracker_settings), do: %{}
+
+  defp normalize_labels(labels) when is_list(labels) do
+    labels
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&(String.trim(&1) |> String.downcase()))
+  end
+
+  defp normalize_labels(_labels), do: []
 
   defp resolve_setting(nil, fallback), do: normalize_string(fallback)
 
